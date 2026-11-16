@@ -79,7 +79,8 @@ function normaliseSignature(sig) {
   if (!sig) return '';
   let s = String(sig).trim();
   if (s.startsWith('sha256=')) s = s.slice('sha256='.length);
-  return s.toLowerCase();
+  // Do NOT lowercase: base64 signatures are case-sensitive.
+  return s;
 }
 
 // Decode a signature header that may be hex or base64 into raw bytes,
@@ -168,7 +169,14 @@ function sendJson(res, status, obj, keyStyle, sigEncoding) {
   const body = JSON.stringify(obj);
   const headers = { 'Content-Type': 'application/json' };
   const sig = signBody(body, keyStyle, sigEncoding);
-  if (sig) headers['x-agent-games-signature'] = sig;
+  if (sig) {
+    headers['x-agent-games-signature'] = sig;
+    // Hedge: also expose the signature base64-encoded under a second
+    // header name, in case the platform's verifier reads that form.
+    const digest = crypto.createHmac('sha256', (keyStyle === 'bytes' && isHexSecret(HMAC_SECRET))
+      ? Buffer.from(HMAC_SECRET, 'hex') : HMAC_SECRET).update(body).digest();
+    headers['x-signature'] = digest.toString('base64');
+  }
   res.writeHead(status, headers);
   res.end(body);
 }
