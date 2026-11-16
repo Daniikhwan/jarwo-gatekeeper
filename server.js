@@ -197,8 +197,9 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // ---- GET /gatekeeper : some preflight probes use GET, not POST ----
-  if (req.method === 'GET' && url.pathname === '/gatekeeper') {
+  // ---- GET /gatekeeper (or /) : some preflight probes use GET, not POST,
+  // and some endpoints are saved without the /gatekeeper path ----
+  if (req.method === 'GET' && (url.pathname === '/gatekeeper' || url.pathname === '/')) {
     return sendJson(res, 200, {
       protocol: 'agent-games.v1',
       status: 'healthy',
@@ -210,8 +211,8 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // ---- POST /gatekeeper : signed task envelope ----
-  if (req.method === 'POST' && url.pathname === '/gatekeeper') {
+  // ---- POST /gatekeeper (or /) : signed task envelope ----
+  if (req.method === 'POST' && (url.pathname === '/gatekeeper' || url.pathname === '/')) {
     let raw;
     try {
       raw = await readRawBody(req);
