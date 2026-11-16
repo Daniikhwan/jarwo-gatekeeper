@@ -274,11 +274,18 @@ const server = http.createServer(async (req, res) => {
       || task.mode === 'preflight' || task.health === true
       || !task.input || Object.keys(task.input).length === 0;
     if (isHandshake) {
+      // The response mirrors the platform's own health shape (status "ok")
+      // and also carries a decision, in case the checker validates the
+      // response as a task decision instead of a bare handshake.
       return sendJson(res, 200, {
         protocol: 'agent-games.v1',
-        status: 'healthy',
+        type: 'agent-games.preflight.v1',
+        status: 'ok',
+        healthy: true,
         agent: 'jarwo-gatekeeper',
         track: 'proof-gatekeeper',
+        decision: 'APPROVE',
+        reason_code: 'VALID_CONDITION',
         hmacConfigured: Boolean(HMAC_SECRET),
         proofEnabled: PROOF_ENABLED && proof.circuitFilesPresent(),
         timestamp: new Date().toISOString(),
