@@ -165,32 +165,34 @@ function decide(input) {
 }
 
 // -------------------------------------------------------------- responses ---
-// The platform signs requests with the secret as a UTF-8 string, but its
-// response verification rejected a string-key signature, so responses are
-// signed with the secret decoded as raw hex bytes instead (when the secret
-// is hex). This is the platform's actual expectation, established by the
-// 10:15 WIB preflight: request verified as keyStyle=string/sigEncoding=hex,
-// response with string-key hex signature was rejected.
-//
-// 10:20-10:22 WIB: the platform also tested (and rejected) the bytes-key
-// response signature, and 10:27 WIB it rejected the new body shape too.
-// Remaining hypothesis: after the secret rotation, the platform's response
-// verifier still uses the PRE-ROTATION secret. If
-// AGENT_GAMES_RESPONSE_HMAC_SECRET is set, responses are signed with that
-// (legacy) secret as a UTF-8 string instead.
-const RESPONSE_HMAC_SECRET = process.env.AGENT_GAMES_RESPONSE_HMAC_SECRET || '';
-function responseKey() {
-  if (RESPONSE_HMAC_SECRET) return RESPONSE_HMAC_SECRET;
-  return (isHexSecret(HMAC_SECRET)) ? Buffer.from(HMAC_SECRET, 'hex') : HMAC_SECRET;
+// How responses are signed (established by elimination across the
+// 10:15-10:50 WIB preflight attempts):
+// - The platform signs requests with the CURRENT secret as a UTF-8 string.
+// - Responses signed with the current secret (string key, hex), the current
+//   secret as raw bytes (hex), and the PRE-ROTATION secret (string key,
+//   hex/base64) were all rejected, as were the "healthy" and "ok"+decision
+//   body shapes. Remaining standard convention: the GitHub-webhook style
+//   "sha256=<hex>" header value, and a canonical body (keys sorted,
+//   Python-style ", " / ": " separators) so a verifier that re-serialises
+//   the parsed JSON hashes the same bytes.
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(canonicalJson).join(', ') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ': ' + canonicalJson(obj[k])).join(', ') + '}';
+}
+
+function responseSignatureHeaders(body) {
+  const digest = crypto.createHmac('sha256', HMAC_SECRET).update(body).digest();
+  return {
+    'x-agent-games-signature': 'sha256=' + digest.toString('hex'),
+    'x-signature': digest.toString('hex'),
+  };
 }
 
 function sendJson(res, status, obj, keyStyle, sigEncoding) {
-  const body = JSON.stringify(obj);
-  const headers = { 'Content-Type': 'application/json' };
-  const key = responseKey();
-  const digest = crypto.createHmac('sha256', key).update(body).digest();
-  headers['x-agent-games-signature'] = digest.toString('hex');
-  headers['x-signature'] = digest.toString('base64');
+  const body = canonicalJson(obj);
+  const headers = { 'Content-Type': 'application/json', ...responseSignatureHeaders(body) };
   res.writeHead(status, headers);
   res.end(body);
 }
@@ -212,7 +214,7 @@ const server = http.createServer(async (req, res) => {
   // HEAD first; answer 200 with the same signed headers as GET, no body.
   // (Previously HEAD fell through to the 404 handler.)
   if (req.method === 'HEAD' && (url.pathname === '/gatekeeper' || url.pathname === '/')) {
-    const body = JSON.stringify({
+    const body = canonicalJson({
       protocol: 'agent-games.v1',
       status: 'healthy',
       agent: 'jarwo-gatekeeper',
@@ -221,11 +223,7 @@ const server = http.createServer(async (req, res) => {
       proofEnabled: PROOF_ENABLED && proof.circuitFilesPresent(),
       timestamp: new Date().toISOString(),
     });
-    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
-    const key = responseKey();
-    const digest = crypto.createHmac('sha256', key).update(body).digest();
-    headers['x-agent-games-signature'] = digest.toString('hex');
-    headers['x-signature'] = digest.toString('base64');
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...responseSignatureHeaders(body) };
     res.writeHead(200, headers);
     res.end();
     return;
