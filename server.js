@@ -67,6 +67,14 @@ function computeHmacHex(secret, rawBody) {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 }
 
+function computeHmacHexWithKey(key, rawBody) {
+  return crypto.createHmac('sha256', key).update(rawBody).digest('hex');
+}
+
+function isHexSecret(s) {
+  return typeof s === 'string' && /^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0;
+}
+
 function normaliseSignature(sig) {
   if (!sig) return '';
   let s = String(sig).trim();
@@ -74,22 +82,41 @@ function normaliseSignature(sig) {
   return s.toLowerCase();
 }
 
-function verifySignature(rawBody, signatureHeader) {
-  if (!HMAC_SECRET) return { ok: false, reason: 'HMAC secret not configured on this server' };
-  const expected = computeHmacHex(HMAC_SECRET, rawBody);
-  const given = normaliseSignature(signatureHeader);
-  if (!given) return { ok: false, reason: 'missing x-agent-games-signature header' };
-  const a = Buffer.from(expected, 'utf8');
-  const b = Buffer.from(given, 'utf8');
-  if (a.length !== b.length) return { ok: false, reason: 'signature length mismatch' };
-  return crypto.timingSafeEqual(a, b)
-    ? { ok: true }
-    : { ok: false, reason: 'signature mismatch' };
+// Decode a signature header that may be hex or base64 into raw bytes.
+function signatureBytes(sig) {
+  const s = normaliseSignature(sig);
+  if (!s) return null;
+  if (/^[0-9a-f]+$/i.test(s) && s.length % 2 === 0) return Buffer.from(s, 'hex');
+  try { return Buffer.from(s, 'base64'); } catch (e) { return null; }
 }
 
-function signBody(rawBody) {
+// The platform's exact HMAC key encoding is not published: the secret may
+// be used as the UTF-8 hex string or as the raw bytes the hex decodes to.
+// Accept both, and remember which one verified so the response is signed
+// the same way.
+function verifySignature(rawBody, signatureHeader) {
+  if (!HMAC_SECRET) return { ok: false, reason: 'HMAC secret not configured on this server' };
+  const given = signatureBytes(signatureHeader);
+  if (!given) return { ok: false, reason: 'missing x-agent-games-signature header' };
+  const keyStyles = [{ name: 'string', key: HMAC_SECRET }];
+  if (isHexSecret(HMAC_SECRET)) {
+    keyStyles.push({ name: 'bytes', key: Buffer.from(HMAC_SECRET, 'hex') });
+  }
+  for (const { name, key } of keyStyles) {
+    const expected = crypto.createHmac('sha256', key).update(rawBody).digest();
+    if (expected.length === given.length && crypto.timingSafeEqual(expected, given)) {
+      return { ok: true, keyStyle: name };
+    }
+  }
+  return { ok: false, reason: 'signature mismatch' };
+}
+
+function signBody(rawBody, keyStyle) {
   if (!HMAC_SECRET) return null;
-  return computeHmacHex(HMAC_SECRET, rawBody);
+  const key = (keyStyle === 'bytes' && isHexSecret(HMAC_SECRET))
+    ? Buffer.from(HMAC_SECRET, 'hex')
+    : HMAC_SECRET;
+  return computeHmacHexWithKey(key, rawBody);
 }
 
 // ------------------------------------------------------------- decisions ----
@@ -134,10 +161,10 @@ function decide(input) {
 }
 
 // -------------------------------------------------------------- responses ---
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, keyStyle) {
   const body = JSON.stringify(obj);
   const headers = { 'Content-Type': 'application/json' };
-  const sig = signBody(body);
+  const sig = signBody(body, keyStyle);
   if (sig) headers['x-agent-games-signature'] = sig;
   res.writeHead(status, headers);
   res.end(body);
@@ -170,6 +197,19 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // ---- GET /gatekeeper : some preflight probes use GET, not POST ----
+  if (req.method === 'GET' && url.pathname === '/gatekeeper') {
+    return sendJson(res, 200, {
+      protocol: 'agent-games.v1',
+      status: 'healthy',
+      agent: 'jarwo-gatekeeper',
+      track: 'proof-gatekeeper',
+      hmacConfigured: Boolean(HMAC_SECRET),
+      proofEnabled: PROOF_ENABLED && proof.circuitFilesPresent(),
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   // ---- POST /gatekeeper : signed task envelope ----
   if (req.method === 'POST' && url.pathname === '/gatekeeper') {
     let raw;
@@ -185,19 +225,25 @@ const server = http.createServer(async (req, res) => {
       console.warn('[gatekeeper] rejected unauthenticated request:', check.reason);
       return sendJson(res, 401, { error: 'invalid signature', reason: check.reason });
     }
+    const keyStyle = check.keyStyle || 'string';
 
     let task;
     try {
       task = JSON.parse(raw.toString('utf8'));
     } catch (e) {
-      return sendJson(res, 400, { error: 'invalid JSON' });
+      return sendJson(res, 400, { error: 'invalid JSON' }, keyStyle);
     }
 
     // Preflight / handshake task: answer with signed protocol-v1 JSON.
-    // (Dashboard reports "The endpoint must return signed protocol-v1 JSON"
-    //  when this is missing — the preflight is the authority on the shape.)
-    const taskType = String(task.type || '');
-    if (taskType.includes('preflight') || task.mode === 'preflight' || task.health === true) {
+    // The probe shape is not published, so treat anything that is not a
+    // full task envelope as a handshake: an explicit preflight/health/
+    // handshake/ping marker, or a body with no task input at all.
+    const taskType = String(task.type || '').toLowerCase();
+    const isHandshake = taskType.includes('preflight') || taskType.includes('health')
+      || taskType.includes('handshake') || taskType.includes('ping')
+      || task.mode === 'preflight' || task.health === true
+      || !task.input || Object.keys(task.input).length === 0;
+    if (isHandshake) {
       return sendJson(res, 200, {
         protocol: 'agent-games.v1',
         status: 'healthy',
@@ -206,7 +252,7 @@ const server = http.createServer(async (req, res) => {
         hmacConfigured: Boolean(HMAC_SECRET),
         proofEnabled: PROOF_ENABLED && proof.circuitFilesPresent(),
         timestamp: new Date().toISOString(),
-      });
+      }, keyStyle);
     }
 
     const input = task.input || {};
@@ -214,7 +260,7 @@ const server = http.createServer(async (req, res) => {
 
     // Idempotency: repeat delivery of the same task_id returns the same response.
     if (taskId && responsesByTaskId.has(taskId)) {
-      return sendJson(res, 200, responsesByTaskId.get(taskId));
+      return sendJson(res, 200, responsesByTaskId.get(taskId), keyStyle);
     }
 
     // Required fields — missing data means we cannot prove anything:
@@ -228,6 +274,7 @@ const server = http.createServer(async (req, res) => {
     if (missing.length > 0) {
       console.warn('[gatekeeper] task missing fields, failing closed:', taskId, missing);
       const fallback = {
+        protocol: 'agent-games.v1',
         decision: 'REJECT',
         reason_code: 'INVALID_INPUT', // NOT an official code — see README; resolve in practice mode.
         proof_tx: input.proof_tx || null,
@@ -235,7 +282,7 @@ const server = http.createServer(async (req, res) => {
         proofStatus: 'not-generated',
       };
       if (taskId) responsesByTaskId.set(taskId, fallback);
-      return sendJson(res, 200, fallback);
+      return sendJson(res, 200, fallback, keyStyle);
     }
 
     // 2. Deterministic decision (7 checks, first failure wins).
@@ -279,6 +326,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const response = {
+      protocol: 'agent-games.v1',
       decision: verdict.decision,
       reason_code: verdict.reason_code,
       proof_tx: input.proof_tx || null,
@@ -291,7 +339,7 @@ const server = http.createServer(async (req, res) => {
       proofStatus,
     };
     if (taskId) responsesByTaskId.set(taskId, response);
-    return sendJson(res, 200, response);
+    return sendJson(res, 200, response, keyStyle);
   }
 
   return sendJson(res, 404, { error: 'not found', hint: 'GET /health or POST /gatekeeper' });
