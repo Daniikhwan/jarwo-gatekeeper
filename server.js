@@ -82,12 +82,13 @@ function normaliseSignature(sig) {
   return s.toLowerCase();
 }
 
-// Decode a signature header that may be hex or base64 into raw bytes.
+// Decode a signature header that may be hex or base64 into raw bytes,
+// remembering which encoding it used so the response can mirror it.
 function signatureBytes(sig) {
   const s = normaliseSignature(sig);
   if (!s) return null;
-  if (/^[0-9a-f]+$/i.test(s) && s.length % 2 === 0) return Buffer.from(s, 'hex');
-  try { return Buffer.from(s, 'base64'); } catch (e) { return null; }
+  if (/^[0-9a-f]+$/i.test(s) && s.length % 2 === 0) return { bytes: Buffer.from(s, 'hex'), encoding: 'hex' };
+  try { return { bytes: Buffer.from(s, 'base64'), encoding: 'base64' }; } catch (e) { return null; }
 }
 
 // The platform's exact HMAC key encoding is not published: the secret may
@@ -96,8 +97,9 @@ function signatureBytes(sig) {
 // the same way.
 function verifySignature(rawBody, signatureHeader) {
   if (!HMAC_SECRET) return { ok: false, reason: 'HMAC secret not configured on this server' };
-  const given = signatureBytes(signatureHeader);
-  if (!given) return { ok: false, reason: 'missing x-agent-games-signature header' };
+  const decoded = signatureBytes(signatureHeader);
+  if (!decoded) return { ok: false, reason: 'missing x-agent-games-signature header' };
+  const given = decoded.bytes;
   const keyStyles = [{ name: 'string', key: HMAC_SECRET }];
   if (isHexSecret(HMAC_SECRET)) {
     keyStyles.push({ name: 'bytes', key: Buffer.from(HMAC_SECRET, 'hex') });
@@ -105,18 +107,19 @@ function verifySignature(rawBody, signatureHeader) {
   for (const { name, key } of keyStyles) {
     const expected = crypto.createHmac('sha256', key).update(rawBody).digest();
     if (expected.length === given.length && crypto.timingSafeEqual(expected, given)) {
-      return { ok: true, keyStyle: name };
+      return { ok: true, keyStyle: name, sigEncoding: decoded.encoding };
     }
   }
   return { ok: false, reason: 'signature mismatch' };
 }
 
-function signBody(rawBody, keyStyle) {
+function signBody(rawBody, keyStyle, sigEncoding) {
   if (!HMAC_SECRET) return null;
   const key = (keyStyle === 'bytes' && isHexSecret(HMAC_SECRET))
     ? Buffer.from(HMAC_SECRET, 'hex')
     : HMAC_SECRET;
-  return computeHmacHexWithKey(key, rawBody);
+  const digest = crypto.createHmac('sha256', key).update(rawBody).digest();
+  return sigEncoding === 'base64' ? digest.toString('base64') : digest.toString('hex');
 }
 
 // ------------------------------------------------------------- decisions ----
@@ -161,10 +164,10 @@ function decide(input) {
 }
 
 // -------------------------------------------------------------- responses ---
-function sendJson(res, status, obj, keyStyle) {
+function sendJson(res, status, obj, keyStyle, sigEncoding) {
   const body = JSON.stringify(obj);
   const headers = { 'Content-Type': 'application/json' };
-  const sig = signBody(body, keyStyle);
+  const sig = signBody(body, keyStyle, sigEncoding);
   if (sig) headers['x-agent-games-signature'] = sig;
   res.writeHead(status, headers);
   res.end(body);
@@ -227,13 +230,26 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 401, { error: 'invalid signature', reason: check.reason });
     }
     const keyStyle = check.keyStyle || 'string';
+    const sigEncoding = check.sigEncoding || 'hex';
 
     let task;
     try {
       task = JSON.parse(raw.toString('utf8'));
     } catch (e) {
-      return sendJson(res, 400, { error: 'invalid JSON' }, keyStyle);
+      return sendJson(res, 400, { error: 'invalid JSON' }, keyStyle, sigEncoding);
     }
+
+    // Diagnostic logging (no secrets, no full bodies): what the platform
+    // actually sends, so a failing preflight can be diagnosed from logs.
+    console.log('[gatekeeper] request', JSON.stringify({
+      path: url.pathname,
+      type: String(task.type || ''),
+      mode: String(task.mode || ''),
+      hasInput: Boolean(task.input),
+      inputKeys: task.input ? Object.keys(task.input) : [],
+      taskId: String(task.task_id || task.taskId || ''),
+      keyStyle, sigEncoding,
+    }));
 
     // Preflight / handshake task: answer with signed protocol-v1 JSON.
     // The probe shape is not published, so treat anything that is not a
@@ -253,7 +269,7 @@ const server = http.createServer(async (req, res) => {
         hmacConfigured: Boolean(HMAC_SECRET),
         proofEnabled: PROOF_ENABLED && proof.circuitFilesPresent(),
         timestamp: new Date().toISOString(),
-      }, keyStyle);
+      }, keyStyle, sigEncoding);
     }
 
     const input = task.input || {};
@@ -261,7 +277,7 @@ const server = http.createServer(async (req, res) => {
 
     // Idempotency: repeat delivery of the same task_id returns the same response.
     if (taskId && responsesByTaskId.has(taskId)) {
-      return sendJson(res, 200, responsesByTaskId.get(taskId), keyStyle);
+      return sendJson(res, 200, responsesByTaskId.get(taskId), keyStyle, sigEncoding);
     }
 
     // Required fields — missing data means we cannot prove anything:
@@ -283,7 +299,7 @@ const server = http.createServer(async (req, res) => {
         proofStatus: 'not-generated',
       };
       if (taskId) responsesByTaskId.set(taskId, fallback);
-      return sendJson(res, 200, fallback, keyStyle);
+      return sendJson(res, 200, fallback, keyStyle, sigEncoding);
     }
 
     // 2. Deterministic decision (7 checks, first failure wins).
@@ -340,7 +356,7 @@ const server = http.createServer(async (req, res) => {
       proofStatus,
     };
     if (taskId) responsesByTaskId.set(taskId, response);
-    return sendJson(res, 200, response, keyStyle);
+    return sendJson(res, 200, response, keyStyle, sigEncoding);
   }
 
   return sendJson(res, 404, { error: 'not found', hint: 'GET /health or POST /gatekeeper' });
