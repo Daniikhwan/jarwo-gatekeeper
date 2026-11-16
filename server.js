@@ -208,6 +208,29 @@ function readRawBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
+  // ---- HEAD /gatekeeper (or /) : URL safety checks often probe with
+  // HEAD first; answer 200 with the same signed headers as GET, no body.
+  // (Previously HEAD fell through to the 404 handler.)
+  if (req.method === 'HEAD' && (url.pathname === '/gatekeeper' || url.pathname === '/')) {
+    const body = JSON.stringify({
+      protocol: 'agent-games.v1',
+      status: 'healthy',
+      agent: 'jarwo-gatekeeper',
+      track: 'proof-gatekeeper',
+      hmacConfigured: Boolean(HMAC_SECRET),
+      proofEnabled: PROOF_ENABLED && proof.circuitFilesPresent(),
+      timestamp: new Date().toISOString(),
+    });
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    const key = responseKey();
+    const digest = crypto.createHmac('sha256', key).update(body).digest();
+    headers['x-agent-games-signature'] = digest.toString('hex');
+    headers['x-signature'] = digest.toString('base64');
+    res.writeHead(200, headers);
+    res.end();
+    return;
+  }
+
   // ---- GET /health : dashboard preflight / readiness probe ----
   if (req.method === 'GET' && url.pathname === '/health') {
     return sendJson(res, 200, {
