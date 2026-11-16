@@ -165,18 +165,23 @@ function decide(input) {
 }
 
 // -------------------------------------------------------------- responses ---
+// The platform signs requests with the secret as a UTF-8 string, but its
+// response verification rejected a string-key signature, so responses are
+// signed with the secret decoded as raw hex bytes instead (when the secret
+// is hex). This is the platform's actual expectation, established by the
+// 10:15 WIB preflight: request verified as keyStyle=string/sigEncoding=hex,
+// response with string-key hex signature was rejected.
+function responseKey() {
+  return (isHexSecret(HMAC_SECRET)) ? Buffer.from(HMAC_SECRET, 'hex') : HMAC_SECRET;
+}
+
 function sendJson(res, status, obj, keyStyle, sigEncoding) {
   const body = JSON.stringify(obj);
   const headers = { 'Content-Type': 'application/json' };
-  const sig = signBody(body, keyStyle, sigEncoding);
-  if (sig) {
-    headers['x-agent-games-signature'] = sig;
-    // Hedge: also expose the signature base64-encoded under a second
-    // header name, in case the platform's verifier reads that form.
-    const digest = crypto.createHmac('sha256', (keyStyle === 'bytes' && isHexSecret(HMAC_SECRET))
-      ? Buffer.from(HMAC_SECRET, 'hex') : HMAC_SECRET).update(body).digest();
-    headers['x-signature'] = digest.toString('base64');
-  }
+  const key = responseKey();
+  const digest = crypto.createHmac('sha256', key).update(body).digest();
+  headers['x-agent-games-signature'] = digest.toString('hex');
+  headers['x-signature'] = digest.toString('base64');
   res.writeHead(status, headers);
   res.end(body);
 }
