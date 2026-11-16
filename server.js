@@ -171,7 +171,16 @@ function decide(input) {
 // is hex). This is the platform's actual expectation, established by the
 // 10:15 WIB preflight: request verified as keyStyle=string/sigEncoding=hex,
 // response with string-key hex signature was rejected.
+//
+// 10:20-10:22 WIB: the platform also tested (and rejected) the bytes-key
+// response signature, and 10:27 WIB it rejected the new body shape too.
+// Remaining hypothesis: after the secret rotation, the platform's response
+// verifier still uses the PRE-ROTATION secret. If
+// AGENT_GAMES_RESPONSE_HMAC_SECRET is set, responses are signed with that
+// (legacy) secret as a UTF-8 string instead.
+const RESPONSE_HMAC_SECRET = process.env.AGENT_GAMES_RESPONSE_HMAC_SECRET || '';
 function responseKey() {
+  if (RESPONSE_HMAC_SECRET) return RESPONSE_HMAC_SECRET;
   return (isHexSecret(HMAC_SECRET)) ? Buffer.from(HMAC_SECRET, 'hex') : HMAC_SECRET;
 }
 
